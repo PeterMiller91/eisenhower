@@ -473,31 +473,64 @@ def extract_json(text: str) -> str:
 def llm_generate_tasks_cached(project: Dict[str, Any], min_tasks: int, model: str) -> Dict[str, Any]:
     if not OPENAI_API_KEY or OpenAI is None:
         raise RuntimeError("OpenAI ist nicht konfiguriert. Setze OPENAI_API_KEY und installiere openai>=1.0.0.")
+
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    # Use Responses API (current best practice for openai-python >= 1.0)
-    # If your account/model uses a different endpoint, adjust here.
+    schema = {
+        "name": "eisenhower_tasks",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "minItems": int(min_tasks),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "title": {"type": "string", "minLength": 2},
+                            "description": {"type": "string"},
+                            "impact": {"type": "integer", "minimum": 1, "maximum": 10},
+                            "effort": {"type": "integer", "minimum": 1, "maximum": 10},
+                            "urgency": {"type": "integer", "minimum": 1, "maximum": 10},
+                            "risk_blocker": {"type": "integer", "minimum": 0, "maximum": 10},
+                            "rationale": {"type": "string"},
+                            "next_action": {"type": "string"},
+                            "dependencies": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": [
+                            "title","description","impact","effort","urgency","risk_blocker",
+                            "rationale","next_action","dependencies"
+                        ]
+                    }
+                },
+                "assumptions": {"type": "array", "items": {"type": "string"}},
+                "notes": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["tasks", "assumptions", "notes"]
+        },
+        # strict=true => Modell darf keine Extra-Felder erfinden
+        "strict": True
+    }
+
     resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": build_user_prompt(project, min_tasks)},
         ],
-        temperature=0.4,
-        max_output_tokens=2500,
+        response_format={
+            "type": "json_schema",
+            "json_schema": schema
+        },
+        temperature=0.3,
+        max_output_tokens=2500
     )
 
-    # responses output can be multi-part; join text chunks
-    out_text = ""
-    for item in resp.output:
-        if item.type == "message":
-            for c in item.content:
-                if c.type in ("output_text", "text"):
-                    out_text += c.text
+    # Bei json_schema ist output_text gültiges JSON.
+    return json.loads(resp.output_text)
 
-    raw = extract_json(out_text)
-    data = json.loads(raw)
-    return data
 
 
 # -----------------------------
@@ -1045,3 +1078,4 @@ with st.expander("🧨 Danger Zone (Task löschen)", expanded=False):
 
 st.divider()
 st.caption("MVP-Hinweis: Passwort-Hashing ist hier bewusst simpel. Für echtes Produkt: bcrypt/passlib + proper auth + HTTPS + Rollen.")
+
