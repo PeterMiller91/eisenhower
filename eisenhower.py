@@ -465,92 +465,25 @@ Aufgabe:
 """.strip()
 
 def extract_json(text: str) -> str:
-    m = re.search(r"\{.*\}", text, re.S)
-    return m.group(0).strip() if m else text.strip()
+    # remove code fences if any
+    text = re.sub(r"```(?:json)?", "", text, flags=re.I).strip()
+    text = text.replace("```", "").strip()
 
-def _stable_cache_key(project: Dict[str, Any], min_tasks: int, model: str) -> str:
-    payload = {"project": project, "min_tasks": int(min_tasks), "model": model}
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    # find first top-level JSON object using a simple bracket balance scan
+    start = text.find("{")
+    if start == -1:
+        return text.strip()
 
-@st.cache_data(show_spinner=False)
-def llm_generate_tasks_cached(cache_key: str) -> Dict[str, Any]:
-    payload = json.loads(cache_key)
-    project = payload["project"]
-    min_tasks = int(payload["min_tasks"])
-    model = payload["model"]
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1].strip()
 
-    if not OPENAI_API_KEY or OpenAI is None:
-        raise RuntimeError("OpenAI ist nicht konfiguriert. Setze OPENAI_API_KEY und installiere openai>=1.0.0.")
-
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    schema = {
-        "name": "eisenhower_tasks",
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "minItems": int(min_tasks),
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "title": {"type": "string", "minLength": 2},
-                            "description": {"type": "string"},
-                            "impact": {"type": "integer", "minimum": 1, "maximum": 10},
-                            "effort": {"type": "integer", "minimum": 1, "maximum": 10},
-                            "urgency": {"type": "integer", "minimum": 1, "maximum": 10},
-                            "risk_blocker": {"type": "integer", "minimum": 0, "maximum": 10},
-                            "rationale": {"type": "string"},
-                            "next_action": {"type": "string"},
-                            "dependencies": {"type": "array", "items": {"type": "string"}}
-                        },
-                        "required": [
-                            "title","description","impact","effort","urgency","risk_blocker",
-                            "rationale","next_action","dependencies"
-                        ]
-                    }
-                },
-                "assumptions": {"type": "array", "items": {"type": "string"}},
-                "notes": {"type": "array", "items": {"type": "string"}}
-            },
-            "required": ["tasks", "assumptions", "notes"]
-        },
-        "strict": True
-    }
-
-    user_prompt = build_user_prompt(project, min_tasks)
-
-    # 1) Try json_schema (best)
-    try:
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_schema", "json_schema": schema},
-            temperature=0.3,
-            max_output_tokens=2500,
-        )
-        return json.loads(resp.output_text)
-    except Exception:
-        # 2) Fallback: plain JSON mode (model-agnostic)
-        resp2 = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_output_tokens=2500,
-        )
-        raw = getattr(resp2, "output_text", "") or ""
-        parsed = json.loads(extract_json(raw))
-        return parsed
-
+    return text.strip()
 # -----------------------------
 # UI helpers
 # -----------------------------
@@ -1143,3 +1076,4 @@ with st.expander("🧨 Danger Zone (Task löschen)", expanded=False):
 
 st.divider()
 st.caption("MVP-Hinweis: Passwort-Hashing ist hier bewusst simpel. Für echtes Produkt: bcrypt/passlib + proper auth + HTTPS + Rollen.")
+
