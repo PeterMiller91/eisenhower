@@ -1,19 +1,18 @@
 # app.py
-# Streamlit Eisenhower Project Planner (GPT-powered) with:
-# - Mini-Brief (context) to avoid generic plans
-# - Structured JSON task output
+# Streamlit Eisenhower Project Planner (robust for Streamlit Cloud)
+# - Login (local SQLite MVP)
+# - Projects + Tasks persistence
 # - Deterministic scoring -> Eisenhower quadrant
-# - Impact/Effort/Urgency + rationale + next action + dependencies
-# - Editable table + "Recompute quadrant" + "Katapult-Task" (One Thing)
-# - SQLite persistence + simple login (local, for MVP)
+# - LLM generation with robust fallback (json_schema if supported, else plain JSON parsing)
 #
 # Run:
 #   streamlit run app.py
 #
-# Env:
+# Env (Streamlit Secrets recommended):
 #   OPENAI_API_KEY=...
 # Optional:
-#   OPENAI_MODEL=gpt-5.2  (fallback: gpt-4.1-mini if unavailable in your account)
+#   OPENAI_MODEL=gpt-5.2 (or any available model in your account)
+#   EISENHOWER_DB=/path/to/db.sqlite
 
 from __future__ import annotations
 
@@ -30,18 +29,8 @@ from typing import List, Dict, Any, Optional, Tuple
 import streamlit as st
 import pandas as pd
 
-# --- Optional OpenAI (only required if you want generation) ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = (os.getenv("OPENAI_MODEL", "") or "gpt-5.2").strip()
-
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-
 # -----------------------------
-# App config
+# App config (MUST be first Streamlit call)
 # -----------------------------
 st.set_page_config(
     page_title="Eisenhower Planner",
@@ -50,22 +39,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Small CSS for quadrant colors and nicer cards
+# --- Optional OpenAI ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL", "") or "gpt-5.2").strip()
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+# -----------------------------
+# Styling
+# -----------------------------
 st.markdown(
     """
 <style>
-/* Quadrant headers */
 .qhdr {font-weight: 800; font-size: 1.05rem; margin: 0 0 .25rem 0;}
 .qsub {opacity: .8; font-size: .85rem; margin: 0 0 .75rem 0;}
-
-/* Quadrant containers */
 .qbox {border-radius: 18px; padding: 14px 14px 8px 14px; border: 1px solid rgba(255,255,255,.08);}
-.q_du_wi {background: rgba(255, 77, 77, 0.10);}     /* urgent+important */
-.q_nd_wi {background: rgba(77, 140, 255, 0.10);}    /* not urgent+important */
-.q_du_nwi {background: rgba(255, 190, 77, 0.12);}   /* urgent+not important */
-.q_nd_nwi {background: rgba(160, 160, 160, 0.10);}  /* not urgent+not important */
+.q_du_wi {background: rgba(255, 77, 77, 0.10);}
+.q_nd_wi {background: rgba(77, 140, 255, 0.10);}
+.q_du_nwi {background: rgba(255, 190, 77, 0.12);}
+.q_nd_nwi {background: rgba(160, 160, 160, 0.10);}
 
-/* Task card */
 .tcard {border-radius: 14px; padding: 10px 12px; margin: 0 0 10px 0; border: 1px solid rgba(255,255,255,.08);}
 .trow {display:flex; gap:10px; align-items:center; justify-content:space-between;}
 .tleft {display:flex; flex-direction:column; gap:4px;}
@@ -83,9 +79,8 @@ hr {border: none; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0;}
     unsafe_allow_html=True,
 )
 
-
 # -----------------------------
-# Data + Scoring
+# Constants / scoring
 # -----------------------------
 QUADRANTS = {
     "DU_WI": "Dringend & Wichtig (DO)",
@@ -93,10 +88,8 @@ QUADRANTS = {
     "DU_NWI": "Dringend & Nicht wichtig (DELEGIEREN)",
     "ND_NWI": "Nicht dringend & Nicht wichtig (ELIMINIEREN)",
 }
-
 STATUS_OPTIONS = ["todo", "doing", "done", "blocked"]
-
-DEFAULT_LIMIT_DU_WI = 3  # hard cap recommendation
+DEFAULT_LIMIT_DU_WI = 3
 
 @dataclass
 class Thresholds:
@@ -105,13 +98,12 @@ class Thresholds:
 
 def clamp_int(x: Any, lo: int, hi: int, default: int) -> int:
     try:
-        v = int(x)
+        v = int(float(x))
         return max(lo, min(hi, v))
     except Exception:
         return default
 
 def compute_importance(impact: int, risk_blocker: int) -> float:
-    # Importance: mostly impact, but risk/blocker matters
     return 0.6 * impact + 0.4 * risk_blocker
 
 def compute_quadrant(impact: int, urgency: int, risk_blocker: int, th: Thresholds) -> Tuple[str, float]:
@@ -127,20 +119,22 @@ def compute_quadrant(impact: int, urgency: int, risk_blocker: int, th: Threshold
     return "ND_NWI", imp
 
 def katapult_score(impact: int, effort: int, urgency: int, risk_blocker: int) -> float:
-    # "Catapult" = high impact per effort, with urgency and blocker/risk as multipliers.
-    # (You can tweak weights later.)
     e = max(1, effort)
     return (impact / e) * (1.0 + 0.08 * urgency) * (1.0 + 0.06 * risk_blocker)
 
-
 # -----------------------------
-# SQLite Persistence
+# SQLite persistence
 # -----------------------------
+# Default DB path that works on Streamlit Cloud (writes in app working dir)
 DB_PATH = os.getenv("EISENHOWER_DB", "eisenhower_app.db")
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except Exception:
+        # Some FS/backends can be picky; fallback to default
+        pass
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
@@ -199,7 +193,6 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def hash_pw(pw: str, salt: str) -> str:
-    # Simple salted hash for MVP. For production use passlib/bcrypt.
     return hashlib.sha256((salt + pw).encode("utf-8")).hexdigest()
 
 def create_user(email: str, pw: str) -> bool:
@@ -231,7 +224,7 @@ def verify_user(email: str, pw: str) -> Optional[int]:
     user_id, pw_hash = row
     try:
         salt, digest = pw_hash.split("$", 1)
-        return user_id if hash_pw(pw, salt) == digest else None
+        return int(user_id) if hash_pw(pw, salt) == digest else None
     except Exception:
         return None
 
@@ -243,7 +236,7 @@ def upsert_project(user_id: int, proj: Dict[str, Any]) -> int:
     ).fetchone()
     t = now_iso()
     if existing:
-        pid = existing[0]
+        pid = int(existing[0])
         conn.execute(
             """UPDATE projects
                SET success_criteria=?, target_audience=?, horizon_days=?, primary_lever=?, constraints=?, updated_at=?
@@ -274,7 +267,7 @@ def upsert_project(user_id: int, proj: Dict[str, Any]) -> int:
                 t,
             ),
         )
-        pid = cur.lastrowid
+        pid = int(cur.lastrowid)
     conn.commit()
     conn.close()
     return int(pid)
@@ -317,23 +310,28 @@ def load_tasks(project_id: int) -> pd.DataFrame:
         (project_id,),
     ).fetchall()
     conn.close()
+
     cols = ["id","title","description","quadrant","impact","effort","urgency","risk_blocker","importance",
             "rationale","next_action","dependencies","status","owner","due_date","updated_at"]
     df = pd.DataFrame(rows, columns=cols)
     if df.empty:
-        # create schema
         df = pd.DataFrame(columns=cols)
     return df
 
 def save_tasks(project_id: int, df: pd.DataFrame):
-    # Upsert tasks by id; new rows without id -> insert
     conn = db()
     t = now_iso()
+
+    df = df.copy()
+    if "id" not in df.columns:
+        df["id"] = ""
+
     for _, r in df.iterrows():
         rid = r.get("id", None)
         title = str(r.get("title", "")).strip()
         if not title:
             continue
+
         payload = {
             "title": title,
             "description": str(r.get("description", "")).strip(),
@@ -350,7 +348,9 @@ def save_tasks(project_id: int, df: pd.DataFrame):
             "owner": str(r.get("owner", "")).strip(),
             "due_date": str(r.get("due_date", "")).strip(),
         }
-        if pd.isna(rid) or rid is None or str(rid).strip() == "":
+
+        is_new = rid is None or (isinstance(rid, float) and pd.isna(rid)) or str(rid).strip() == ""
+        if is_new:
             conn.execute(
                 """INSERT INTO tasks(project_id, title, description, quadrant, impact, effort, urgency, risk_blocker, importance,
                                     rationale, next_action, dependencies, status, owner, due_date, created_at, updated_at)
@@ -397,10 +397,11 @@ def save_tasks(project_id: int, df: pd.DataFrame):
                     payload["owner"],
                     payload["due_date"],
                     t,
-                    int(rid),
+                    int(float(rid)),
                     project_id,
                 ),
             )
+
     conn.commit()
     conn.close()
 
@@ -410,9 +411,8 @@ def delete_task(project_id: int, task_id: int):
     conn.commit()
     conn.close()
 
-
 # -----------------------------
-# LLM Task Generation
+# LLM task generation (robust)
 # -----------------------------
 TASK_SCHEMA_HINT = {
     "tasks": [
@@ -432,11 +432,13 @@ TASK_SCHEMA_HINT = {
     "notes": ["…"]
 }
 
-SYSTEM_PROMPT = """Du bist ein extrem pragmatischer Projekt-Operator. Du lieferst keine generischen Listen.
-Du erzeugst Aufgaben, die eine Person sofort ausführen kann (konkrete Next Actions).
-Du hältst dich strikt an das JSON-Format und das Schema.
-Keine Markdown-Ausgabe, nur gültiges JSON.
-"""
+SYSTEM_PROMPT = (
+    "Du bist ein extrem pragmatischer Projekt-Operator. "
+    "Du lieferst keine generischen Listen. "
+    "Du erzeugst Aufgaben, die eine Person sofort ausführen kann (konkrete Next Actions). "
+    "Du hältst dich strikt an das JSON-Format und das Schema. "
+    "Keine Markdown-Ausgabe, nur gültiges JSON."
+)
 
 def build_user_prompt(project: Dict[str, Any], min_tasks: int) -> str:
     return f"""
@@ -463,14 +465,20 @@ Aufgabe:
 """.strip()
 
 def extract_json(text: str) -> str:
-    # try to find first {...} block
     m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return text.strip()
-    return m.group(0).strip()
+    return m.group(0).strip() if m else text.strip()
+
+def _stable_cache_key(project: Dict[str, Any], min_tasks: int, model: str) -> str:
+    payload = {"project": project, "min_tasks": int(min_tasks), "model": model}
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 @st.cache_data(show_spinner=False)
-def llm_generate_tasks_cached(project: Dict[str, Any], min_tasks: int, model: str) -> Dict[str, Any]:
+def llm_generate_tasks_cached(cache_key: str) -> Dict[str, Any]:
+    payload = json.loads(cache_key)
+    project = payload["project"]
+    min_tasks = int(payload["min_tasks"])
+    model = payload["model"]
+
     if not OPENAI_API_KEY or OpenAI is None:
         raise RuntimeError("OpenAI ist nicht konfiguriert. Setze OPENAI_API_KEY und installiere openai>=1.0.0.")
 
@@ -510,28 +518,38 @@ def llm_generate_tasks_cached(project: Dict[str, Any], min_tasks: int, model: st
             },
             "required": ["tasks", "assumptions", "notes"]
         },
-        # strict=true => Modell darf keine Extra-Felder erfinden
         "strict": True
     }
 
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(project, min_tasks)},
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": schema
-        },
-        temperature=0.3,
-        max_output_tokens=2500
-    )
+    user_prompt = build_user_prompt(project, min_tasks)
 
-    # Bei json_schema ist output_text gültiges JSON.
-    return json.loads(resp.output_text)
-
-
+    # 1) Try json_schema (best)
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_schema", "json_schema": schema},
+            temperature=0.3,
+            max_output_tokens=2500,
+        )
+        return json.loads(resp.output_text)
+    except Exception:
+        # 2) Fallback: plain JSON mode (model-agnostic)
+        resp2 = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_output_tokens=2500,
+        )
+        raw = getattr(resp2, "output_text", "") or ""
+        parsed = json.loads(extract_json(raw))
+        return parsed
 
 # -----------------------------
 # UI helpers
@@ -579,11 +597,20 @@ def render_task_card(row: pd.Series, highlight: bool = False):
     )
 
 def recompute_all(df: pd.DataFrame, th: Thresholds) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
     df = df.copy()
-    # normalize scores, compute quadrant + importance
-    quads = []
-    imps = []
-    for _, r in df.iterrows():
+
+    # ensure required columns exist
+    for c, default in [
+        ("impact", 5), ("effort", 5), ("urgency", 5), ("risk_blocker", 3),
+        ("quadrant", "ND_WI"), ("importance", 0.0), ("status", "todo")
+    ]:
+        if c not in df.columns:
+            df[c] = default
+
+    quads, imps = [], []
+    for idx, r in df.iterrows():
         impact = clamp_int(r.get("impact", 5), 1, 10, 5)
         effort = clamp_int(r.get("effort", 5), 1, 10, 5)
         urgency = clamp_int(r.get("urgency", 5), 1, 10, 5)
@@ -591,16 +618,17 @@ def recompute_all(df: pd.DataFrame, th: Thresholds) -> pd.DataFrame:
         q, imp = compute_quadrant(impact, urgency, risk, th)
         quads.append(q)
         imps.append(imp)
-        df.at[_, "impact"] = impact
-        df.at[_, "effort"] = effort
-        df.at[_, "urgency"] = urgency
-        df.at[_, "risk_blocker"] = risk
+        df.at[idx, "impact"] = impact
+        df.at[idx, "effort"] = effort
+        df.at[idx, "urgency"] = urgency
+        df.at[idx, "risk_blocker"] = risk
+
     df["quadrant"] = quads
     df["importance"] = imps
     return df
 
 def pick_one_thing(df: pd.DataFrame) -> Optional[int]:
-    if df.empty:
+    if df is None or df.empty:
         return None
     candidates = df[df["status"].isin(["todo", "doing"])].copy()
     if candidates.empty:
@@ -614,27 +642,42 @@ def pick_one_thing(df: pd.DataFrame) -> Optional[int]:
         ),
         axis=1,
     )
-    # prefer important quadrants
     pref = {"DU_WI": 3, "ND_WI": 2, "DU_NWI": 1, "ND_NWI": 0}
     candidates["q_pref"] = candidates["quadrant"].map(pref).fillna(0)
     candidates["rank"] = candidates["k_score"] + candidates["q_pref"] * 0.8
     best = candidates.sort_values("rank", ascending=False).iloc[0]
-    return int(best["id"]) if str(best.get("id","")).strip() else None
 
+    rid = best.get("id", None)
+    if rid is None or (isinstance(rid, float) and pd.isna(rid)) or str(rid).strip() == "":
+        return None
+    try:
+        return int(float(rid))
+    except Exception:
+        return None
 
 # -----------------------------
-# App start
+# Session defaults
+# -----------------------------
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
+if "project_id" not in st.session_state:
+    st.session_state.project_id = None
+if "strict_mode" not in st.session_state:
+    st.session_state.strict_mode = True
+if "last_llm_meta" not in st.session_state:
+    st.session_state.last_llm_meta = None
+
+# -----------------------------
+# Start app
 # -----------------------------
 init_db()
 
 st.title("🧭 Eisenhower Project Planner")
 st.caption("Projekt → Aufgaben → Scores → Eisenhower → Fokus. Mit editierbarer Tabelle, Persistenz und Katapult-Task.")
 
-# Sidebar: Auth
+# Sidebar: Auth + settings
 with st.sidebar:
     st.header("🔐 Login")
-    if "user_id" not in st.session_state:
-        st.session_state.user_id = None
     if st.session_state.user_id is None:
         tab_login, tab_signup = st.tabs(["Anmelden", "Registrieren"])
         with tab_login:
@@ -670,19 +713,26 @@ with st.sidebar:
     important_cut = st.slider("Wichtigkeits-Schwelle (Importance)", 1, 10, 7)
     th = Thresholds(urgent_cut=urgent_cut, important_cut=important_cut)
 
-    du_wi_limit = st.number_input("Empf. Limit DO-Quadrant (DU_WI)", min_value=1, max_value=10, value=DEFAULT_LIMIT_DU_WI)
+    du_wi_limit = st.number_input(
+        "Empf. Limit DO-Quadrant (DU_WI)", min_value=1, max_value=10, value=DEFAULT_LIMIT_DU_WI
+    )
+
+    st.session_state.strict_mode = st.toggle(
+        "Strict Mode: Quadrant immer aus Scores",
+        value=st.session_state.strict_mode,
+        help="An: Quadranten werden aus Impact/Urgency/Risk berechnet. Aus: Deine manuelle Auswahl bleibt erhalten.",
+    )
 
     st.divider()
     st.header("🤖 LLM")
     st.write("API-Key erkannt ✅" if OPENAI_API_KEY else "API-Key fehlt ❌ (OPENAI_API_KEY setzen)")
-    model = st.text_input("Model", value=OPENAI_MODEL, help="z.B. gpt-5.2 (wenn verfügbar), sonst gpt-4.1-mini o.ä.")
+    model = st.text_input("Model", value=OPENAI_MODEL, help="z.B. gpt-5.2, gpt-4.1-mini o.ä. (je nach Account)")
     min_tasks = st.slider("Min. Aufgaben", 10, 40, 12, 1)
 
-
+# Gate
 if st.session_state.user_id is None:
     st.info("Bitte zuerst einloggen, damit Projekte & Tasks gespeichert werden.")
     st.stop()
-
 
 # Project selection/creation
 projects = list_projects(st.session_state.user_id)
@@ -718,15 +768,29 @@ with colB:
 
     c1, c2, c3 = st.columns([1.3, 1.0, 1.0], gap="medium")
     with c1:
-        project_name = st.text_input("Projektname / Hauptziel", value=default_name, placeholder="z.B. Streamlit App für Reels-Generator launchen")
+        project_name = st.text_input(
+            "Projektname / Hauptziel", value=default_name,
+            placeholder="z.B. Streamlit App für Reels-Generator launchen"
+        )
     with c2:
         horizon_days = st.number_input("Zeithorizont (Tage)", min_value=1, max_value=365, value=int(default_h))
     with c3:
-        primary_lever = st.selectbox("Primärer Hebel", ["Umsatz", "Reichweite", "Produkt", "Prozess", "Lernen"], index=["Umsatz","Reichweite","Produkt","Prozess","Lernen"].index(default_lever) if default_lever in ["Umsatz","Reichweite","Produkt","Prozess","Lernen"] else 0)
+        levers = ["Umsatz", "Reichweite", "Produkt", "Prozess", "Lernen"]
+        idx = levers.index(default_lever) if default_lever in levers else 0
+        primary_lever = st.selectbox("Primärer Hebel", levers, index=idx)
 
-    success_criteria = st.text_input("Erfolgskriterium (1 Satz)", value=default_success, placeholder="z.B. MVP live + 50 Nutzer in 30 Tagen")
-    target_audience = st.text_input("Zielgruppe", value=default_aud, placeholder="z.B. Fitness-Coaches, die Reels schneller produzieren wollen")
-    constraints = st.text_area("Constraints (optional)", value=default_constraints, height=70, placeholder="Zeit/Woche, Budget, Tools, technische Vorgaben …")
+    success_criteria = st.text_input(
+        "Erfolgskriterium (1 Satz)", value=default_success,
+        placeholder="z.B. MVP live + 50 Nutzer in 30 Tagen"
+    )
+    target_audience = st.text_input(
+        "Zielgruppe", value=default_aud,
+        placeholder="z.B. Fitness-Coaches, die Reels schneller produzieren wollen"
+    )
+    constraints = st.text_area(
+        "Constraints (optional)", value=default_constraints, height=70,
+        placeholder="Zeit/Woche, Budget, Tools, technische Vorgaben …"
+    )
 
     save_proj = st.button("Projekt speichern / aktualisieren", type="primary", use_container_width=True)
     if save_proj:
@@ -759,18 +823,20 @@ st.divider()
 
 # Load tasks
 df = load_tasks(project["id"])
-if "id" in df.columns and not df.empty:
-    # ensure dtypes
+if not df.empty:
     for c in ["impact","effort","urgency","risk_blocker"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(5).astype(int)
     df["importance"] = pd.to_numeric(df["importance"], errors="coerce").fillna(0.0)
+    if "status" in df.columns:
+        df["status"] = df["status"].astype(str).where(df["status"].isin(STATUS_OPTIONS), "todo")
 
 # Controls row
 cX, cY, cZ, cW = st.columns([1.2, 1.0, 1.0, 1.2], gap="medium")
+
 with cX:
     if st.button("🔁 Quadranten neu berechnen", use_container_width=True):
-        df = recompute_all(df, th)
-        save_tasks(project["id"], df)
+        df2 = recompute_all(df, th)
+        save_tasks(project["id"], df2)
         st.success("Neu berechnet & gespeichert.")
         st.rerun()
 
@@ -785,7 +851,7 @@ with cY:
             "effort": 3,
             "urgency": 4,
             "risk_blocker": 2,
-            "importance": compute_importance(6,2),
+            "importance": compute_importance(6, 2),
             "rationale": "",
             "next_action": "",
             "dependencies": "",
@@ -794,19 +860,29 @@ with cY:
             "due_date": "",
             "updated_at": now_iso(),
         }
-        df = pd.concat([pd.DataFrame([new_row]), df], ignore_index=True)
-        save_tasks(project["id"], recompute_all(df, th))
+        df2 = pd.concat([pd.DataFrame([new_row]), df], ignore_index=True)
+        df2 = recompute_all(df2, th)
+        save_tasks(project["id"], df2)
         st.rerun()
 
 with cZ:
     if st.button("💾 Speichern", use_container_width=True):
-        df = recompute_all(df, th)
-        save_tasks(project["id"], df)
+        df2 = recompute_all(df, th) if st.session_state.strict_mode else df.copy()
+        if not df2.empty and not st.session_state.strict_mode:
+            # keep manual quadrants, recompute importance
+            df2["importance"] = df2.apply(
+                lambda r: compute_importance(
+                    clamp_int(r.get("impact", 5), 1, 10, 5),
+                    clamp_int(r.get("risk_blocker", 3), 0, 10, 3),
+                ),
+                axis=1,
+            )
+        save_tasks(project["id"], df2)
         st.success("Gespeichert.")
         st.rerun()
 
 with cW:
-    gen = st.button("🤖 Aufgaben generieren (LLM)", use_container_width=True, disabled=not bool(OPENAI_API_KEY))
+    gen = st.button("🤖 Aufgaben generieren (LLM)", use_container_width=True, disabled=not bool(OPENAI_API_KEY and OpenAI))
     if gen:
         with st.spinner("Generiere Aufgaben…"):
             try:
@@ -818,8 +894,14 @@ with cW:
                     "primary_lever": project["primary_lever"],
                     "constraints": project.get("constraints",""),
                 }
-                data = llm_generate_tasks_cached(proj_payload, int(min_tasks), model.strip())
+                cache_key = _stable_cache_key(proj_payload, int(min_tasks), model.strip())
+                data = llm_generate_tasks_cached(cache_key)
+
                 tasks = data.get("tasks", [])
+                assumptions = data.get("assumptions", [])
+                notes = data.get("notes", [])
+                st.session_state.last_llm_meta = {"assumptions": assumptions, "notes": notes}
+
                 if not isinstance(tasks, list) or len(tasks) < 5:
                     st.error("LLM-Antwort unbrauchbar (zu wenige Tasks).")
                 else:
@@ -832,7 +914,9 @@ with cW:
                         effort = clamp_int(t.get("effort", 4), 1, 10, 4)
                         urgency = clamp_int(t.get("urgency", 5), 1, 10, 5)
                         risk = clamp_int(t.get("risk_blocker", 3), 0, 10, 3)
+
                         q, imp = compute_quadrant(impact, urgency, risk, th)
+
                         deps = t.get("dependencies", [])
                         if isinstance(deps, list):
                             deps_s = ", ".join([str(x).strip() for x in deps if str(x).strip()])
@@ -858,48 +942,47 @@ with cW:
                             "updated_at": now_iso(),
                         })
 
-                    # Merge: prepend generated tasks
                     gen_df = pd.DataFrame(rows)
-                    df = pd.concat([gen_df, df], ignore_index=True)
-                    df = recompute_all(df, th)
-                    save_tasks(project["id"], df)
+                    df2 = pd.concat([gen_df, df], ignore_index=True)
+                    df2 = recompute_all(df2, th)
+                    save_tasks(project["id"], df2)
                     st.success(f"{len(rows)} Aufgaben hinzugefügt.")
                     st.rerun()
 
             except Exception as e:
                 st.error(f"Generierung fehlgeschlagen: {e}")
 
-# Show assumptions/notes if present in cache for this project (best-effort)
-with st.expander("🧠 Hinweise/Annahmen der Generierung (falls vorhanden)", expanded=False):
-    st.write("Wenn du gerade generiert hast, siehst du hier evtl. Annahmen/Notizen (Cache-basiert).")
-    try:
-        proj_payload = {
-            "name": project["name"],
-            "success_criteria": project["success_criteria"],
-            "target_audience": project["target_audience"],
-            "horizon_days": project["horizon_days"],
-            "primary_lever": project["primary_lever"],
-            "constraints": project.get("constraints",""),
-        }
-        # Only show if generation exists in cache for this key
-        # (Streamlit doesn't expose cache inspection; so we skip if it errors)
-        pass
-    except Exception:
-        pass
+with st.expander("🧠 Hinweise/Annahmen der letzten Generierung", expanded=False):
+    meta = st.session_state.last_llm_meta or {}
+    assumptions = meta.get("assumptions", [])
+    notes = meta.get("notes", [])
+    if not assumptions and not notes:
+        st.caption("Noch keine Generierung in dieser Session oder keine Meta-Daten vorhanden.")
+    else:
+        if assumptions:
+            st.markdown("**Annahmen**")
+            for a in assumptions:
+                st.write(f"- {a}")
+        if notes:
+            st.markdown("**Notizen**")
+            for n in notes:
+                st.write(f"- {n}")
 
 st.divider()
 
-# Compute One Thing
-df = recompute_all(df, th) if not df.empty else df
+# Recompute + One Thing
+df = load_tasks(project["id"])
+df = recompute_all(df, th) if st.session_state.strict_mode else df
 one_id = pick_one_thing(df) if not df.empty else None
 
-# Quick health warning: too many in DO quadrant
 du_wi_count = int((df["quadrant"] == "DU_WI").sum()) if not df.empty else 0
 if du_wi_count > int(du_wi_limit):
-    st.warning(f"Du hast {du_wi_count} Tasks in **Dringend & Wichtig**. Empfehlung: max. {int(du_wi_limit)}. "
-               "Alles darüber ist meist Überforderung → schiebe Dinge nach PLAN/DELEGIEREN oder zerlege.")
+    st.warning(
+        f"Du hast {du_wi_count} Tasks in **Dringend & Wichtig**. Empfehlung: max. {int(du_wi_limit)}. "
+        "Alles darüber ist meist Überforderung → schiebe Dinge nach PLAN/DELEGIEREN oder zerlege."
+    )
 
-# Editor (single source of truth)
+# Editor
 st.subheader("🗂️ Editierbare Task-Tabelle (Single Source of Truth)")
 
 if df.empty:
@@ -907,26 +990,13 @@ if df.empty:
 else:
     editor_df = df.copy()
 
-    # Friendlier quadrant names in editor, map back
     q_label = {k: QUADRANTS[k] for k in QUADRANTS}
     q_rev = {v: k for k, v in q_label.items()}
     editor_df["quadrant_label"] = editor_df["quadrant"].map(q_label)
 
     display_cols = [
-        "id",
-        "title",
-        "status",
-        "quadrant_label",
-        "impact",
-        "effort",
-        "urgency",
-        "risk_blocker",
-        "importance",
-        "next_action",
-        "dependencies",
-        "rationale",
-        "owner",
-        "due_date",
+        "id","title","status","quadrant_label","impact","effort","urgency","risk_blocker",
+        "importance","next_action","dependencies","rationale","owner","due_date"
     ]
 
     edited = st.data_editor(
@@ -953,73 +1023,63 @@ else:
         key="task_editor",
     )
 
-    c1, c2, c3 = st.columns([1.1, 1.1, 1.8], gap="medium")
+    c1, c2 = st.columns([1.2, 2.8], gap="medium")
     with c1:
         if st.button("✅ Änderungen übernehmen", use_container_width=True):
-            # Map quadrant label back
             edited2 = edited.copy()
             edited2["quadrant"] = edited2["quadrant_label"].map(q_rev).fillna("ND_WI")
             edited2.drop(columns=["quadrant_label"], inplace=True)
-            # Recompute based on scores (override manual quadrant selection if you want strict mode)
-            edited2 = recompute_all(edited2, th)
 
-            # Save
+            if st.session_state.strict_mode:
+                edited2 = recompute_all(edited2, th)
+            else:
+                edited2["importance"] = edited2.apply(
+                    lambda r: compute_importance(
+                        clamp_int(r.get("impact", 5), 1, 10, 5),
+                        clamp_int(r.get("risk_blocker", 3), 0, 10, 3),
+                    ),
+                    axis=1,
+                )
+
             save_tasks(project["id"], edited2)
             st.success("Änderungen gespeichert.")
             st.rerun()
 
     with c2:
-        strict = st.toggle("Strict Mode: Quadrant immer aus Scores", value=True)
-        if st.button("🧮 Recompute jetzt", use_container_width=True):
-            edited2 = edited.copy()
-            edited2["quadrant"] = edited2["quadrant_label"].map(q_rev).fillna("ND_WI")
-            edited2.drop(columns=["quadrant_label"], inplace=True)
-            if strict:
-                edited2 = recompute_all(edited2, th)
-            else:
-                # Keep chosen quadrant but recompute importance
-                imps = []
-                for _, r in edited2.iterrows():
-                    imps.append(compute_importance(
-                        clamp_int(r.get("impact", 5), 1, 10, 5),
-                        clamp_int(r.get("risk_blocker", 3), 0, 10, 3),
-                    ))
-                edited2["importance"] = imps
-            save_tasks(project["id"], edited2)
-            st.success("Neu berechnet & gespeichert.")
-            st.rerun()
-
-    with c3:
-        st.caption("Tipp: Wenn du willst, dass deine manuelle Eisenhower-Auswahl zählt, schalte Strict Mode aus. "
-                   "Wenn du Konsistenz willst: Strict Mode an (empfohlen).")
+        st.caption(
+            "Strict Mode an = Quadrant wird immer berechnet (konsistent). "
+            "Strict Mode aus = deine Auswahl bleibt, Importance wird trotzdem berechnet."
+        )
 
 st.divider()
 
 # Board view
 st.subheader("🟦 Eisenhower Board (farblich + Fokus)")
 
+df = load_tasks(project["id"])
+df = recompute_all(df, th) if st.session_state.strict_mode else df
+one_id = pick_one_thing(df) if not df.empty else None
+
 if df.empty:
     st.stop()
 
-# Ensure one_id after possible edits
-df = load_tasks(project["id"])
-df = recompute_all(df, th) if not df.empty else df
-one_id = pick_one_thing(df) if not df.empty else None
-
-# Split into quadrants
 q_dfs = {q: df[df["quadrant"] == q].copy() for q in QUADRANTS.keys()}
-
-# Sort within quadrants by "katapult" score descending
 for q, qdf in q_dfs.items():
     if qdf.empty:
         continue
-    qdf["k_score"] = qdf.apply(lambda r: katapult_score(
-        int(r.get("impact", 5)),
-        int(r.get("effort", 5)),
-        int(r.get("urgency", 5)),
-        int(r.get("risk_blocker", 3)),
-    ), axis=1)
-    q_dfs[q] = qdf.sort_values(["status", "k_score"], ascending=[True, False])
+    qdf["k_score"] = qdf.apply(
+        lambda r: katapult_score(
+            int(r.get("impact", 5)),
+            int(r.get("effort", 5)),
+            int(r.get("urgency", 5)),
+            int(r.get("risk_blocker", 3)),
+        ),
+        axis=1,
+    )
+    # status sort: todo -> doing -> blocked -> done (custom)
+    status_rank = {"todo": 0, "doing": 1, "blocked": 2, "done": 3}
+    qdf["status_rank"] = qdf["status"].map(status_rank).fillna(9)
+    q_dfs[q] = qdf.sort_values(["status_rank", "k_score"], ascending=[True, False])
 
 cA, cB = st.columns(2, gap="large")
 cC, cD = st.columns(2, gap="large")
@@ -1033,43 +1093,48 @@ quad_layout = [
 
 for q, col, tag in quad_layout:
     with col:
-        st.markdown(f"<div class='qbox {quadrant_class(q)}'>"
-                    f"<div class='qhdr'>{tag} — {QUADRANTS[q]}</div>"
-                    f"<div class='qsub'>Sortiert nach Katapult-Potenzial (Impact/Effort + Urgency + Blocker).</div>"
-                    f"</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='qbox {quadrant_class(q)}'>"
+            f"<div class='qhdr'>{tag} — {QUADRANTS[q]}</div>"
+            f"<div class='qsub'>Sortiert nach Katapult-Potenzial (Impact/Effort + Urgency + Blocker).</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
         qdf = q_dfs[q]
         if qdf.empty:
             st.caption("— leer —")
         else:
-            # Soft cap warning for DO quadrant
             if q == "DU_WI" and len(qdf) > int(du_wi_limit):
                 st.warning("Zu viele DO-Tasks. Schiebe runter oder zerlege, bis max. Limit erreicht.")
 
-            # render cards
             for _, row in qdf.iterrows():
-                highlight = (one_id is not None and str(row.get("id","")).strip() and int(row["id"]) == one_id)
+                highlight = (
+                    one_id is not None
+                    and str(row.get("id","")).strip() != ""
+                    and int(float(row["id"])) == one_id
+                )
                 render_task_card(row, highlight=highlight)
 
 st.divider()
 
-# One Thing callout
+# One Thing
 st.subheader("🎯 Katapult-Task (One Thing)")
 if one_id is None:
     st.info("Kein aktiver Task gefunden (alles done?).")
 else:
-    one_row = df[df["id"] == one_id].iloc[0]
+    one_row = df[df["id"].astype(str) == str(one_id)].iloc[0]
     render_task_card(one_row, highlight=True)
 
 st.caption("Regel: Diese eine Sache zuerst. Wenn du nur 30 Minuten hast — genau daran arbeiten.")
 
-# Danger-zone: delete by id
+# Delete
 with st.expander("🧨 Danger Zone (Task löschen)", expanded=False):
     st.write("Löschen ist endgültig.")
     del_id = st.text_input("Task-ID zum Löschen", placeholder="z.B. 12")
     if st.button("Task löschen"):
         try:
-            tid = int(del_id)
+            tid = int(float(del_id))
             delete_task(project["id"], tid)
             st.success("Gelöscht.")
             st.rerun()
@@ -1078,4 +1143,3 @@ with st.expander("🧨 Danger Zone (Task löschen)", expanded=False):
 
 st.divider()
 st.caption("MVP-Hinweis: Passwort-Hashing ist hier bewusst simpel. Für echtes Produkt: bcrypt/passlib + proper auth + HTTPS + Rollen.")
-
