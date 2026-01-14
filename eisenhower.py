@@ -23,7 +23,7 @@ import sqlite3
 import hashlib
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
@@ -45,8 +45,10 @@ OPENAI_MODEL = (os.getenv("OPENAI_MODEL", "") or "gpt-5.2").strip()
 
 try:
     from openai import OpenAI
-except Exception:
+    HAS_OPENAI = True
+except ImportError:
     OpenAI = None
+    HAS_OPENAI = False
 
 # -----------------------------
 # Styling
@@ -74,6 +76,13 @@ st.markdown(
 .b_stat {background: rgba(120, 255, 160, 0.10);}
 .small {font-size:.82rem; opacity:.9;}
 hr {border: none; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0;}
+
+/* New styles for better UI */
+.stats-box {border-radius: 12px; padding: 12px; margin: 10px 0; background: rgba(255,255,255,0.05);}
+.stat-row {display: flex; justify-content: space-between; margin: 8px 0;}
+.stat-label {font-size: 0.9rem; opacity: 0.8;}
+.stat-value {font-weight: bold;}
+.export-btn {margin: 5px 0;}
 </style>
 """,
     unsafe_allow_html=True,
@@ -89,6 +98,7 @@ QUADRANTS = {
     "ND_NWI": "Nicht dringend & Nicht wichtig (ELIMINIEREN)",
 }
 STATUS_OPTIONS = ["todo", "doing", "done", "blocked"]
+STATUS_EMOJIS = {"todo": "📝", "doing": "🔄", "done": "✅", "blocked": "🚫"}
 DEFAULT_LIMIT_DU_WI = 3
 
 @dataclass
@@ -411,6 +421,49 @@ def delete_task(project_id: int, task_id: int):
     conn.commit()
     conn.close()
 
+def duplicate_task(project_id: int, task_id: int) -> bool:
+    """Duplicate a task with '(Copy)' suffix"""
+    conn = db()
+    row = conn.execute(
+        """SELECT title, description, quadrant, impact, effort, urgency, risk_blocker, importance,
+                  rationale, next_action, dependencies, status, owner, due_date
+           FROM tasks WHERE id=? AND project_id=?""",
+        (task_id, project_id)
+    ).fetchone()
+    
+    if not row:
+        conn.close()
+        return False
+    
+    t = now_iso()
+    conn.execute(
+        """INSERT INTO tasks(project_id, title, description, quadrant, impact, effort, urgency, risk_blocker, importance,
+                            rationale, next_action, dependencies, status, owner, due_date, created_at, updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            project_id,
+            f"{row[0]} (Copy)",
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[7],
+            row[8],
+            row[9],
+            row[10],
+            row[11],
+            row[12],
+            row[13],
+            t,
+            t,
+        )
+    )
+    conn.commit()
+    conn.close()
+    return True
+
 # -----------------------------
 # LLM task generation (robust)
 # -----------------------------
@@ -484,6 +537,60 @@ def extract_json(text: str) -> str:
                 return text[start:i+1].strip()
 
     return text.strip()
+
+def _stable_cache_key(project: Dict[str, Any], min_tasks: int, model: str) -> str:
+    """Create a stable cache key for LLM calls"""
+    import hashlib
+    data = json.dumps({
+        "project": project,
+        "min_tasks": min_tasks,
+        "model": model,
+    }, sort_keys=True)
+    return hashlib.md5(data.encode()).hexdigest()
+
+def llm_generate_tasks(project: Dict[str, Any], min_tasks: int, model: str) -> Dict[str, Any]:
+    """Call OpenAI to generate tasks"""
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY not set")
+    
+    if not HAS_OPENAI:
+        raise ImportError("OpenAI library not installed")
+    
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    prompt = build_user_prompt(project, min_tasks)
+    
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=4000
+        )
+        
+        text = response.choices[0].message.content
+        json_text = extract_json(text)
+        data = json.loads(json_text)
+        return data
+    except Exception as e:
+        raise Exception(f"LLM generation failed: {str(e)}")
+
+def llm_generate_tasks_cached(project: Dict[str, Any], min_tasks: int, model: str) -> Dict[str, Any]:
+    """Cached version of LLM generation"""
+    cache_key = _stable_cache_key(project, min_tasks, model)
+    
+    if "llm_cache" not in st.session_state:
+        st.session_state.llm_cache = {}
+    
+    if cache_key in st.session_state.llm_cache:
+        return st.session_state.llm_cache[cache_key]
+    
+    data = llm_generate_tasks(project, min_tasks, model)
+    st.session_state.llm_cache[cache_key] = data
+    return data
+
 # -----------------------------
 # UI helpers
 # -----------------------------
@@ -504,8 +611,21 @@ def render_task_card(row: pd.Series, highlight: bool = False):
     importance = float(row.get("importance", 0.0))
     rationale = str(row.get("rationale", "")).strip()
     next_action = str(row.get("next_action", "")).strip()
+    owner = str(row.get("owner", "")).strip()
+    due_date = str(row.get("due_date", "")).strip()
 
     border = "2px solid rgba(120,255,160,.35)" if highlight else "1px solid rgba(255,255,255,.08)"
+    
+    # Format due date if present
+    due_display = ""
+    if due_date:
+        try:
+            due_display = f" | 📅 {due_date}"
+        except:
+            due_display = f" | 📅 {due_date}"
+    
+    owner_display = f" | 👤 {owner}" if owner else ""
+    
     st.markdown(
         f"""
 <div class="tcard" style="border:{border}">
@@ -513,11 +633,13 @@ def render_task_card(row: pd.Series, highlight: bool = False):
     <div class="tleft">
       <div class="ttitle">{title}</div>
       <div class="tmeta">
-        <span class="badge b_stat">Status: {status}</span>
+        <span class="badge b_stat">{STATUS_EMOJIS.get(status, "📝")} {status}</span>
         <span class="badge b_imp">Impact {impact}</span>
         <span class="badge b_eff">Effort {effort}</span>
         <span class="badge b_urg">Urgency {urgency}</span>
         <span class="badge">Importance {importance:.1f}</span>
+        {owner_display}
+        {due_display}
       </div>
     </div>
   </div>
@@ -588,6 +710,36 @@ def pick_one_thing(df: pd.DataFrame) -> Optional[int]:
     except Exception:
         return None
 
+def get_project_stats(project_id: int) -> Dict[str, Any]:
+    """Get statistics for a project"""
+    df = load_tasks(project_id)
+    if df.empty:
+        return {
+            "total_tasks": 0,
+            "by_quadrant": {},
+            "by_status": {},
+            "avg_impact": 0,
+            "avg_effort": 0,
+            "overdue_count": 0
+        }
+    
+    stats = {
+        "total_tasks": len(df),
+        "by_quadrant": df["quadrant"].value_counts().to_dict(),
+        "by_status": df["status"].value_counts().to_dict(),
+        "avg_impact": df["impact"].mean(),
+        "avg_effort": df["effort"].mean(),
+        "overdue_count": 0
+    }
+    
+    # Check for overdue tasks
+    today = date.today().isoformat()
+    if "due_date" in df.columns:
+        overdue = df[(df["due_date"] != "") & (df["due_date"] < today) & (df["status"] != "done")]
+        stats["overdue_count"] = len(overdue)
+    
+    return stats
+
 # -----------------------------
 # Session defaults
 # -----------------------------
@@ -599,6 +751,8 @@ if "strict_mode" not in st.session_state:
     st.session_state.strict_mode = True
 if "last_llm_meta" not in st.session_state:
     st.session_state.last_llm_meta = None
+if "llm_cache" not in st.session_state:
+    st.session_state.llm_cache = {}
 
 # -----------------------------
 # Start app
@@ -661,6 +815,49 @@ with st.sidebar:
     st.write("API-Key erkannt ✅" if OPENAI_API_KEY else "API-Key fehlt ❌ (OPENAI_API_KEY setzen)")
     model = st.text_input("Model", value=OPENAI_MODEL, help="z.B. gpt-5.2, gpt-4.1-mini o.ä. (je nach Account)")
     min_tasks = st.slider("Min. Aufgaben", 10, 40, 12, 1)
+    
+    # Project stats
+    if st.session_state.project_id:
+        st.divider()
+        st.header("📊 Projekt-Statistik")
+        stats = get_project_stats(st.session_state.project_id)
+        
+        st.markdown(f"""
+        <div class="stats-box">
+            <div class="stat-row">
+                <span class="stat-label">Gesamtaufgaben:</span>
+                <span class="stat-value">{stats['total_tasks']}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Durchschn. Impact:</span>
+                <span class="stat-value">{stats['avg_impact']:.1f}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Durchschn. Effort:</span>
+                <span class="stat-value">{stats['avg_effort']:.1f}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Überfällig:</span>
+                <span class="stat-value">{stats['overdue_count']}</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Export functionality
+        st.divider()
+        st.header("📤 Export")
+        if st.button("📥 Tasks als CSV exportieren", use_container_width=True):
+            df = load_tasks(st.session_state.project_id)
+            if not df.empty:
+                csv = df.to_csv(index=False)
+                project_name = load_project(st.session_state.user_id, st.session_state.project_id)["name"]
+                st.download_button(
+                    label="📥 CSV herunterladen",
+                    data=csv,
+                    file_name=f"eisenhower_tasks_{project_name}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
 
 # Gate
 if st.session_state.user_id is None:
@@ -815,7 +1012,7 @@ with cZ:
         st.rerun()
 
 with cW:
-    gen = st.button("🤖 Aufgaben generieren (LLM)", use_container_width=True, disabled=not bool(OPENAI_API_KEY and OpenAI))
+    gen = st.button("🤖 Aufgaben generieren (LLM)", use_container_width=True, disabled=not bool(OPENAI_API_KEY and HAS_OPENAI))
     if gen:
         with st.spinner("Generiere Aufgaben…"):
             try:
@@ -827,8 +1024,7 @@ with cW:
                     "primary_lever": project["primary_lever"],
                     "constraints": project.get("constraints",""),
                 }
-                cache_key = _stable_cache_key(proj_payload, int(min_tasks), model.strip())
-                data = llm_generate_tasks_cached(cache_key)
+                data = llm_generate_tasks_cached(proj_payload, int(min_tasks), model.strip())
 
                 tasks = data.get("tasks", [])
                 assumptions = data.get("assumptions", [])
@@ -951,7 +1147,7 @@ else:
             "dependencies": st.column_config.TextColumn("Abhängigkeiten", width="large"),
             "rationale": st.column_config.TextColumn("Warum (Impact-Begründung)", width="large"),
             "owner": st.column_config.TextColumn("Owner", width="small"),
-            "due_date": st.column_config.TextColumn("Fällig (frei)", width="small"),
+            "due_date": st.column_config.DateColumn("Fällig", width="small"),
         },
         key="task_editor",
     )
@@ -1061,19 +1257,35 @@ else:
 
 st.caption("Regel: Diese eine Sache zuerst. Wenn du nur 30 Minuten hast — genau daran arbeiten.")
 
-# Delete
-with st.expander("🧨 Danger Zone (Task löschen)", expanded=False):
-    st.write("Löschen ist endgültig.")
-    del_id = st.text_input("Task-ID zum Löschen", placeholder="z.B. 12")
-    if st.button("Task löschen"):
-        try:
-            tid = int(float(del_id))
-            delete_task(project["id"], tid)
-            st.success("Gelöscht.")
-            st.rerun()
-        except Exception:
-            st.error("Ungültige ID.")
+# Danger Zone
+with st.expander("🧨 Danger Zone", expanded=False):
+    tab_del, tab_dup = st.tabs(["🗑️ Task löschen", "📋 Task duplizieren"])
+    
+    with tab_del:
+        st.write("Löschen ist endgültig.")
+        del_id = st.text_input("Task-ID zum Löschen", placeholder="z.B. 12", key="del_id")
+        if st.button("Task löschen", type="secondary"):
+            try:
+                tid = int(float(del_id))
+                delete_task(project["id"], tid)
+                st.success("Gelöscht.")
+                st.rerun()
+            except Exception:
+                st.error("Ungültige ID.")
+    
+    with tab_dup:
+        st.write("Erstellt eine Kopie einer existierenden Task.")
+        dup_id = st.text_input("Task-ID zum Duplizieren", placeholder="z.B. 12", key="dup_id")
+        if st.button("Task duplizieren", type="secondary"):
+            try:
+                tid = int(float(dup_id))
+                if duplicate_task(project["id"], tid):
+                    st.success("Dupliziert.")
+                    st.rerun()
+                else:
+                    st.error("Task nicht gefunden.")
+            except Exception:
+                st.error("Ungültige ID.")
 
 st.divider()
 st.caption("MVP-Hinweis: Passwort-Hashing ist hier bewusst simpel. Für echtes Produkt: bcrypt/passlib + proper auth + HTTPS + Rollen.")
-
