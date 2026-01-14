@@ -1,3 +1,33 @@
-streamlit>=1.36.0
-pandas>=2.0.0
-openai>=1.30.0
+# Eisenhower Project Planner – Locked Requirements
+# GitHub: einfach als "requirements.txt" ins Repo legen
+# Streamlit Cloud erkennt & installiert automatisch
+
+# ----- Core -----
+streamlit==1.32.2
+pandas==2.2.2
+numpy==1.26.4
+
+# ----- Auth & Security -----
+bcrypt==4.1.3
+
+# ----- OpenAI -----
+openai==1.30.1
+
+# ----- SQLite & DB -----
+# (sqlite3 ist in Python stdlib enthalten – keine extra Zeile nötig)
+
+# ----- Utilities -----
+python-dotenv==1.0.1          # lädt .env Dateien (lokal)
+pytz==2024.1                  # sichere Zeitzonen
+tzdata==2024.1                # Windows-kompatible Zeitzonen-Daten
+
+# ----- Optional aber empfohlen für künftige Erweiterungen -----
+# Pillow==10.3.0              # Bilder in Streamlit anzeigen
+# requests==2.32.3            # API-Calls (falls du weitere Services anbindest)
+# matplotlib==3.9.0           # Charts (falls du Visualisierungen erweiterst)
+# seaborn==0.13.2             # schönere Diagramme
+# openpyxl==3.1.2             # Excel-Export (falls gewünscht)
+# streamlit-aggrid==1.0.5     # leistungsfähige Tabelle (kommt häufig in Erweiterungen)
+
+# ----- Python-Version (Annotation für GitHub Actions / Docker) -----
+# python_version >= "3.9"       # Kommentar – wird von pip ignoriert
